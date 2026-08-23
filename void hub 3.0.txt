@@ -1,0 +1,2307 @@
+-- ============================================
+-- VOID HUB 3.0 (ПОЛНАЯ ВЕРСИЯ)
+-- ============================================
+
+local Players = game:GetService("Players")
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
+local HttpService = game:GetService("HttpService")
+local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local StarterGui = game:GetService("StarterGui")
+local Lighting = game:GetService("Lighting")
+
+local LocalPlayer = Players.LocalPlayer
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+
+-- ============================================
+-- ПРОВЕРКА НАЛИЧИЯ GUI
+-- ============================================
+if PlayerGui:FindFirstChild("VoidHubGui") then
+    PlayerGui.VoidHubGui:Destroy()
+end
+
+-- ============================================
+-- ПОДКЛЮЧЕНИЕ ПАКЕТОВ
+-- ============================================
+local packets
+pcall(function()
+    packets = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("Packets"))
+end)
+
+-- ============================================
+-- ПЕРЕМЕННЫЕ ДЛЯ КЛАВИШИ ОТКРЫТИЯ
+-- ============================================
+local guiOpenKey = Enum.KeyCode.RightControl
+local guiIsOpen = true
+
+-- ============================================
+-- AUTO HEAL (ИЗ ВЕРСИИ 1.0)
+-- ============================================
+local heal_enabled = false
+local heal_threshold = 30
+local heal_cps = 75
+local heal_selectedFruit = "Bloodfruit"
+local heal_lastEatTime = 0
+
+local heal_fruitList = {
+    "Bloodfruit", "Bluefruit", "Berry", "Strawberry", "Lemon", "Coconut",
+    "Jelly", "Banana", "Orange", "Oddberry", "Strangefruit", "Sunfruit",
+    "Pumpkin", "Prickly Pear", "Apple", "Barley", "Cloudberry", "Carrot"
+}
+
+local function heal_useItem(itemName)
+    local tool = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Tool")
+    if tool and tool.Name == itemName then
+        pcall(function()
+            tool:Activate()
+            task.wait(0.01)
+            tool:Deactivate()
+        end)
+        return true
+    end
+    local inventory = PlayerGui:FindFirstChild("MainGui")
+    if not inventory then return false end
+    local rightPanel = inventory:FindFirstChild("RightPanel")
+    if not rightPanel then return false end
+    local invList = rightPanel:FindFirstChild("Inventory")
+    if not invList then return false end
+    local list = invList:FindFirstChild("List")
+    if not list then return false end
+    for _, child in ipairs(list:GetChildren()) do
+        if child:IsA("ImageLabel") and child.Name == itemName then
+            if packets and packets.UseBagItem and packets.UseBagItem.send then
+                packets.UseBagItem.send(child.LayoutOrder)
+                return true
+            end
+        end
+    end
+    return false
+end
+
+-- Цикл Auto Heal
+task.spawn(function()
+    while true do
+        if heal_enabled then
+            local currentTime = tick()
+            local eatInterval = 1 / heal_cps
+            if currentTime - heal_lastEatTime >= eatInterval then
+                local humanoid = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+                if humanoid then
+                    local hpPercent = (humanoid.Health / humanoid.MaxHealth) * 100
+                    if hpPercent <= heal_threshold then
+                        if heal_useItem(heal_selectedFruit) then
+                            heal_lastEatTime = currentTime
+                        end
+                    end
+                end
+            end
+        end
+        task.wait(0.01)
+    end
+end)
+
+-- ============================================
+-- GOLD FARM С ПОЛНОЙ СИСТЕМОЙ WAYPOINTS
+-- ============================================
+local GoldFarm = {
+    Enabled = false,
+    Running = false,
+    CurrentTarget = nil,
+    CurrentNode = nil,
+    LastNodeTime = 0,
+    NodeCooldown = 0.5,
+    Range = 50,
+    MinGold = 5,
+    AutoSell = false,
+    SellThreshold = 100,
+    UseVeins = true,
+    UseOres = true,
+    UseGold = true,
+    -- Система Waypoints
+    Waypoints = {},
+    WaypointParts = {},
+    CurrentWaypointIndex = 1,
+    AutoTween = false,
+    TweenSpeed = 16,
+    RecordedPositions = {},
+    LastSpeedChange = 0,
+    SpeedChangeInterval = 2,
+    CurrentSpeedMultiplier = 1,
+    RayParams = RaycastParams.new(),
+    TargetType = "All",
+    MovementMode = "Walk",
+    WalkSpeed = 16,
+}
+
+GoldFarm.RayParams.FilterType = Enum.RaycastFilterType.Blacklist
+GoldFarm.RayParams.FilterDescendantsInstances = {LocalPlayer.Character}
+
+-- Вспомогательные функции Gold Farm
+function GoldFarm:getRandomizedSpeed(baseSpeed)
+    if tick() - self.LastSpeedChange > self.SpeedChangeInterval then
+        if baseSpeed <= 0 then return baseSpeed end
+        local minSpeed = baseSpeed - 0.5
+        local maxSpeed = baseSpeed
+        local chosenSpeed = minSpeed + (math.random() * (maxSpeed - minSpeed))
+        self.CurrentSpeedMultiplier = chosenSpeed / baseSpeed
+        self.LastSpeedChange = tick()
+    end
+    return baseSpeed * self.CurrentSpeedMultiplier
+end
+
+function GoldFarm:hasLineOfSight(startPos, endPos)
+    local direction = (endPos - startPos)
+    local distance = direction.Magnitude
+    if distance < 1 then return true end
+    local rayResult = Workspace:Raycast(startPos + Vector3.new(0, 2, 0), direction, self.RayParams)
+    if rayResult then
+        local hitDist = (rayResult.Position - startPos).Magnitude
+        if hitDist < (distance * 0.9) then return false end
+    end
+    return true
+end
+
+function GoldFarm:wouldTweenHitTerrain(startPos, endPos)
+    local sampleCount = 3 
+    local direction = (endPos - startPos)
+    for i = 0, sampleCount do
+        local t = i / sampleCount
+        local samplePos = startPos + (direction * t)
+        local ray = Workspace:Raycast(samplePos, Vector3.new(0, -5, 0), self.RayParams)
+        if not ray then continue end
+        if ray and samplePos.Y < ray.Position.Y then return true, samplePos end
+    end
+    return false
+end
+
+function GoldFarm:isPathClearToTarget(startPos, endPos)
+    local direction = (endPos - startPos)
+    local distance = direction.Magnitude
+    if distance < 1 then return true end
+    direction = direction.Unit
+    local rayOrigin = startPos + Vector3.new(0, 2, 0)
+    local rayDirection = (endPos + Vector3.new(0, 2, 0)) - rayOrigin
+    local ray = Workspace:Raycast(rayOrigin, rayDirection, self.RayParams)
+    if ray then
+        local hitDistance = (ray.Position - rayOrigin).Magnitude
+        local targetDistance = (endPos - startPos).Magnitude
+        if hitDistance < (targetDistance * 0.9) then return false, ray.Position end
+    end
+    return true
+end
+
+function GoldFarm:hasGroundBeneath(position)
+    local ray = Workspace:Raycast(position, Vector3.new(0, -100, 0), self.RayParams)
+    if ray then
+        local hitPart = ray.Instance
+        if hitPart and hitPart:IsA("BasePart") then
+            local distance = (position - ray.Position).Magnitude
+            return true, distance, ray.Position
+        end
+    end
+    return false, 999, nil
+end
+
+function GoldFarm:isAboveWater(position)
+    if position.Y > 100 then return false end 
+    local ray = Workspace:Raycast(position, Vector3.new(0, -200, 0), self.RayParams)
+    if ray and ray.Instance and ray.Instance:IsA("Terrain") then
+        local region = Region3.new(ray.Position - Vector3.new(4, 4, 4), ray.Position + Vector3.new(4, 4, 4))
+        region = region:ExpandToGrid(4)
+        local materials, sizes = Workspace.Terrain:ReadVoxels(region, 4)
+        local size = materials.Size
+        for x = 1, size.X do
+            for y = 1, size.Y do
+                for z = 1, size.Z do
+                    if materials[x][y][z] == Enum.Material.Water then return true end
+                end
+            end
+        end
+    end
+    return false
+end
+
+function GoldFarm:findNearestAccessibleWaypoint(currentPos)
+    if #self.RecordedPositions > 0 then
+        local closestIndex = self.CurrentWaypointIndex
+        local closestDist = math.huge
+        local foundAccessible = false
+        for idx, pos in ipairs(self.RecordedPositions) do
+            if pos and pos.X and pos.Y and pos.Z then
+                local waypoint = Vector3.new(pos.X, pos.Y, pos.Z)
+                local dist = (waypoint - currentPos).Magnitude
+                if dist < closestDist then
+                    if dist > 150 then continue end
+                    local hasLOS = self:hasLineOfSight(currentPos, waypoint)
+                    local wouldHitTerrain = self:wouldTweenHitTerrain(currentPos, waypoint)
+                    if hasLOS and not wouldHitTerrain then
+                        closestDist = dist
+                        closestIndex = idx
+                        foundAccessible = true
+                    end
+                end
+            end
+        end
+        if not foundAccessible then
+            closestDist = math.huge
+            for idx, pos in ipairs(self.RecordedPositions) do
+                if pos and pos.X and pos.Y and pos.Z then
+                    local waypoint = Vector3.new(pos.X, pos.Y, pos.Z)
+                    local dist = (waypoint - currentPos).Magnitude
+                    if dist < closestDist then 
+                        closestDist = dist 
+                        closestIndex = idx 
+                    end
+                end
+            end
+        end
+        return closestIndex, closestDist, foundAccessible
+    end
+    return self.CurrentWaypointIndex, math.huge, false
+end
+
+function GoldFarm:findGoldInRadius(position, radius)
+    local targets = {}
+    local namePatterns = {}
+    
+    if self.UseVeins then table.insert(namePatterns, "Gold Vein") end
+    if self.UseOres then table.insert(namePatterns, "Gold Ore") end
+    if self.UseGold then table.insert(namePatterns, "Gold") end
+    
+    for _, pattern in ipairs(namePatterns) do
+        for _, obj in ipairs(Workspace:GetDescendants()) do
+            if obj:IsA("BasePart") and obj.Name:find(pattern) then
+                local distance = (obj.Position - position).Magnitude
+                if distance <= radius then
+                    local goldAmount = obj:GetAttribute("GoldAmount") or obj:GetAttribute("Amount") or 1
+                    if goldAmount >= self.MinGold then
+                        table.insert(targets, {
+                            Object = obj,
+                            Position = obj.Position,
+                            Distance = distance,
+                            GoldAmount = goldAmount,
+                            Name = obj.Name,
+                        })
+                    end
+                end
+            end
+        end
+    end
+    
+    table.sort(targets, function(a, b) return a.Distance < b.Distance end)
+    return targets
+end
+
+function GoldFarm:moveToTarget(targetPos)
+    local char = LocalPlayer.Character
+    if not char then return false end
+    
+    local root = char:FindFirstChild("HumanoidRootPart")
+    local humanoid = char:FindFirstChildOfClass("Humanoid")
+    if not root or not humanoid then return false end
+    
+    if self.MovementMode == "Tween" then
+        local distance = (targetPos - root.Position).Magnitude
+        local speed = self:getRandomizedSpeed(self.WalkSpeed)
+        local duration = distance / speed
+        
+        local tweenInfo = TweenInfo.new(
+            duration,
+            Enum.EasingStyle.Linear,
+            Enum.EasingDirection.Out
+        )
+        
+        local tween = TweenService:Create(root, tweenInfo, {CFrame = CFrame.new(targetPos)})
+        tween:Play()
+        tween.Completed:Wait()
+        return true
+    else
+        humanoid.AutoRotate = true
+        humanoid.WalkSpeed = self:getRandomizedSpeed(self.WalkSpeed)
+        
+        local startTime = tick()
+        local timeout = 30
+        
+        while tick() - startTime < timeout do
+            if not self.Enabled then return false end
+            
+            local currentPos = root.Position
+            local distance = (targetPos - currentPos).Magnitude
+            
+            if distance < 2 then 
+                humanoid.WalkSpeed = 16
+                return true 
+            end
+            
+            local direction = (targetPos - currentPos).Unit
+            local moveVector = direction * humanoid.WalkSpeed
+            
+            local pathClear, hitPos = self:isPathClearToTarget(currentPos, targetPos)
+            if not pathClear then
+                local avoidDirection = (currentPos - hitPos).Unit * Vector3.new(1, 0, 1)
+                local avoidPos = currentPos + avoidDirection * 2
+                humanoid:MoveTo(avoidPos)
+            else
+                humanoid:MoveTo(targetPos)
+            end
+            
+            task.wait(0.05)
+        end
+        
+        humanoid.WalkSpeed = 16
+        return false
+    end
+end
+
+function GoldFarm:mineGold(target)
+    if not target or not target.Object then return false end
+    
+    local char = LocalPlayer.Character
+    if not char then return false end
+    
+    local tool = char:FindFirstChildOfClass("Tool")
+    if not tool then return false end
+    
+    local root = char:FindFirstChild("HumanoidRootPart")
+    if not root then return false end
+    
+    local lookAt = CFrame.new(root.Position, target.Position)
+    root.CFrame = lookAt
+    
+    pcall(function()
+        tool:Activate()
+        task.wait(0.05)
+        tool:Deactivate()
+    end)
+    
+    self.LastNodeTime = tick()
+    return true
+end
+
+-- Система Waypoints для Gold Farm
+function GoldFarm:createWaypointVisual(position, index)
+    local part = Instance.new("Part")
+    part.Name = "GoldWaypoint_" .. index
+    part.Shape = Enum.PartType.Ball
+    part.Size = Vector3.new(2, 2, 2)
+    part.Position = position
+    part.Anchored = true
+    part.CanCollide = false
+    part.Material = Enum.Material.ForceField
+    part.Transparency = 0.3
+    part.Color = Color3.fromRGB(255, 215, 0)
+    
+    local glow = Instance.new("PointLight")
+    glow.Range = 6
+    glow.Brightness = 3
+    glow.Color = Color3.fromRGB(255, 215, 0)
+    glow.Parent = part
+    
+    local billboard = Instance.new("BillboardGui")
+    billboard.Name = "WaypointInfo"
+    billboard.Size = UDim2.new(0, 80, 0, 30)
+    billboard.AlwaysOnTop = true
+    billboard.MaxDistance = 150
+    billboard.StudsOffset = Vector3.new(0, 3, 0)
+    billboard.Parent = part
+    
+    local textLabel = Instance.new("TextLabel")
+    textLabel.Name = "Text"
+    textLabel.Size = UDim2.new(1, 0, 1, 0)
+    textLabel.BackgroundTransparency = 1
+    textLabel.TextColor3 = Color3.new(1, 1, 1)
+    textLabel.TextStrokeTransparency = 0
+    textLabel.Font = Enum.Font.SourceSansBold
+    textLabel.TextSize = 14
+    textLabel.Text = "💰 " .. index
+    textLabel.Parent = billboard
+    
+    local ring = Instance.new("SelectionBox")
+    ring.Adornee = part
+    ring.LineThickness = 0.2
+    ring.Color3 = Color3.fromRGB(255, 215, 0)
+    ring.Transparency = 0.5
+    ring.Parent = part
+    
+    part.Parent = Workspace
+    return part
+end
+
+function GoldFarm:updateWaypointVisuals()
+    for _, part in pairs(self.WaypointParts) do
+        if part and part.Parent then
+            part:Destroy()
+        end
+    end
+    self.WaypointParts = {}
+    
+    for i, waypoint in ipairs(self.Waypoints) do
+        local pos = Vector3.new(waypoint.X, waypoint.Y, waypoint.Z)
+        local part = self:createWaypointVisual(pos, i)
+        table.insert(self.WaypointParts, part)
+    end
+end
+
+function GoldFarm:addCurrentWaypoint()
+    local char = LocalPlayer.Character
+    if not char then return false, "Character not found" end
+    
+    local root = char:FindFirstChild("HumanoidRootPart")
+    if not root then return false, "Root not found" end
+    
+    local pos = root.Position
+    table.insert(self.Waypoints, {
+        X = pos.X,
+        Y = pos.Y,
+        Z = pos.Z
+    })
+    
+    self:updateWaypointVisuals()
+    return true, "Waypoint #" .. #self.Waypoints .. " added!"
+end
+
+function GoldFarm:clearWaypoints()
+    self.Waypoints = {}
+    self.WaypointParts = {}
+    self.CurrentWaypointIndex = 1
+    self:updateWaypointVisuals()
+    return true, "All waypoints cleared!"
+end
+
+function GoldFarm:removeLastWaypoint()
+    if #self.Waypoints > 0 then
+        table.remove(self.Waypoints, #self.Waypoints)
+        self:updateWaypointVisuals()
+        return true, "Last waypoint removed!"
+    end
+    return false, "No waypoints to remove!"
+end
+
+function GoldFarm:loadWaypointsFromString(inputString)
+    local success = false
+    
+    local jsonSuccess, data = pcall(function()
+        return HttpService:JSONDecode(inputString)
+    end)
+    
+    if jsonSuccess and type(data) == "table" then
+        self:clearWaypoints()
+        for i, waypoint in ipairs(data) do
+            if waypoint.X and waypoint.Y and waypoint.Z then
+                table.insert(self.Waypoints, {
+                    X = waypoint.X,
+                    Y = waypoint.Y,
+                    Z = waypoint.Z
+                })
+            end
+        end
+        self:updateWaypointVisuals()
+        success = true
+    else
+        self:clearWaypoints()
+        for line in inputString:gmatch("[^\r\n]+") do
+            local x, y, z = line:match("([%-%d%.]+)[,%s]+([%-%d%.]+)[,%s]+([%-%d%.]+)")
+            if x and y and z then
+                table.insert(self.Waypoints, {
+                    X = tonumber(x),
+                    Y = tonumber(y),
+                    Z = tonumber(z)
+                })
+            end
+        end
+        if #self.Waypoints > 0 then
+            self:updateWaypointVisuals()
+            success = true
+        end
+    end
+    
+    return success
+end
+
+function GoldFarm:copyWaypoints()
+    if #self.Waypoints == 0 then return "" end
+    
+    local data = {}
+    for i, w in ipairs(self.Waypoints) do
+        table.insert(data, {
+            X = w.X,
+            Y = w.Y,
+            Z = w.Z
+        })
+    end
+    
+    local json = HttpService:JSONEncode(data)
+    setclipboard(json)
+    return json
+end
+
+function GoldFarm:moveToNextWaypoint()
+    if #self.Waypoints == 0 then return false end
+    
+    if self.CurrentWaypointIndex > #self.Waypoints then
+        self.CurrentWaypointIndex = 1
+    end
+    
+    local waypoint = self.Waypoints[self.CurrentWaypointIndex]
+    local targetPos = Vector3.new(waypoint.X, waypoint.Y, waypoint.Z)
+    
+    local char = LocalPlayer.Character
+    if not char then return false end
+    
+    local root = char:FindFirstChild("HumanoidRootPart")
+    local humanoid = char:FindFirstChildOfClass("Humanoid")
+    if not root or not humanoid then return false end
+    
+    local currentPos = root.Position
+    local distance = (targetPos - currentPos).Magnitude
+    
+    if distance < 3 then
+        self.CurrentWaypointIndex = self.CurrentWaypointIndex + 1
+        return true
+    end
+    
+    if self.MovementMode == "Tween" then
+        local duration = distance / self.TweenSpeed
+        local tween = TweenService:Create(root, TweenInfo.new(duration, Enum.EasingStyle.Linear), {
+            CFrame = CFrame.new(targetPos)
+        })
+        tween:Play()
+        tween.Completed:Wait()
+    else
+        humanoid.AutoRotate = true
+        humanoid.WalkSpeed = self.TweenSpeed
+        humanoid:MoveTo(targetPos)
+        
+        local timeout = tick() + 30
+        while tick() < timeout do
+            if not self.Enabled then break end
+            local newDist = (targetPos - root.Position).Magnitude
+            if newDist < 3 then break end
+            task.wait(0.05)
+        end
+        humanoid.WalkSpeed = 16
+    end
+    
+    self.CurrentWaypointIndex = self.CurrentWaypointIndex + 1
+    return true
+end
+
+function GoldFarm:Start()
+    if self.Running then return end
+    self.Running = true
+    self.Enabled = true
+    
+    task.spawn(function()
+        while self.Enabled do
+            local char = LocalPlayer.Character
+            if not char then 
+                task.wait(1)
+                continue 
+            end
+            
+            local root = char:FindFirstChild("HumanoidRootPart")
+            if not root then 
+                task.wait(1)
+                continue 
+            end
+            
+            local currentPos = root.Position
+            
+            if #self.Waypoints > 0 and self.AutoTween then
+                if not self:moveToNextWaypoint() then
+                    self.CurrentWaypointIndex = 1
+                end
+                task.wait(0.1)
+                continue
+            end
+            
+            local targets = self:findGoldInRadius(currentPos, self.Range)
+            
+            if #targets > 0 then
+                local target = targets[1]
+                
+                if target.Distance > self.Range then
+                    task.wait(0.5)
+                    continue
+                end
+                
+                local moved = self:moveToTarget(target.Position)
+                
+                if moved then
+                    self:mineGold(target)
+                end
+            else
+                if #self.RecordedPositions > 0 then
+                    local idx, dist = self:findNearestAccessibleWaypoint(currentPos)
+                    if dist > 10 then
+                        local waypoint = Vector3.new(
+                            self.RecordedPositions[idx].X,
+                            self.RecordedPositions[idx].Y,
+                            self.RecordedPositions[idx].Z
+                        )
+                        self:moveToTarget(waypoint)
+                    end
+                else
+                    task.wait(1)
+                end
+            end
+            
+            task.wait(0.1)
+        end
+        self.Running = false
+    end)
+end
+
+function GoldFarm:Stop()
+    self.Enabled = false
+    self.Running = false
+    local char = LocalPlayer.Character
+    if char then
+        local humanoid = char:FindFirstChildOfClass("Humanoid")
+        if humanoid then
+            humanoid.WalkSpeed = 16
+            humanoid:ChangeState(Enum.HumanoidStateType.Running)
+        end
+    end
+end
+
+-- ============================================
+-- СИСТЕМА БИНДОВ КЛАВИШ
+-- ============================================
+local function toggleGUI()
+    guiIsOpen = not guiIsOpen
+    
+    if guiIsOpen then
+        mainFrame.Visible = true
+        TweenService:Create(mainFrame, TweenInfo.new(0.3, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+            Position = UDim2.new(0.5, -260, 0.5, -190),
+            BackgroundTransparency = 0.15,
+        }):Play()
+    else
+        TweenService:Create(mainFrame, TweenInfo.new(0.3, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {
+            Position = UDim2.new(0.5, -260, -1.5, -190),
+            BackgroundTransparency = 1,
+        }):Play()
+        task.wait(0.3)
+        mainFrame.Visible = false
+    end
+end
+
+-- ============================================
+-- ПЕРЕМЕННЫЕ СОСТОЯНИЯ
+-- ============================================
+local InfiniteJumpEnabled = false
+local SpeedEnabled = false
+local TargetWalkSpeed = 16
+local DefaultWalkSpeed = 16
+
+local hitboxEnabled = false
+local hitboxSize = 1
+
+local farm_selectedFruit = "Bloodfruit"
+local farm_plantRange = 30
+local farm_plantDelay = 0.1
+local farm_autoPlant = false
+local farm_autoHarvest = false
+local plantedBoxes = {}
+local lastPlantTime = 0
+
+local Settings = {
+    Aura = {
+        Resource = false,
+        Range = 20,
+        ResourceAuraSpeed = 1,
+        ResourceFilter = "All"
+    }
+}
+
+local farm_fruitList = {
+    "Bloodfruit", "Bluefruit", "Berry", "Strawberry", "Lemon", "Coconut",
+    "Jelly", "Banana", "Orange", "Oddberry", "Strangefruit", "Sunfruit",
+    "Pumpkin", "Prickly Pear", "Apple", "Barley", "Cloudberry", "Carrot"
+}
+
+local fruitToItemID = {
+    Bloodfruit = 94, Bluefruit = 377, Lemon = 99, Coconut = 1,
+    Jelly = 604, Banana = 606, Orange = 602, Oddberry = 32,
+    Berry = 35, Strangefruit = 302, Strawberry = 282,
+    Sunfruit = 128, Pumpkin = 80, ["Prickly Pear"] = 378,
+    Apple = 243, Barley = 247, Cloudberry = 101, Carrot = 147
+}
+
+-- ============================================
+-- ЦВЕТОВЫЕ ТЕМЫ (12 ТЕМ)
+-- ============================================
+local THEMES = {
+    ["Dark (Черная)"] = {
+        MainBg = Color3.fromRGB(20, 20, 24),
+        SidebarBg = Color3.fromRGB(28, 28, 34),
+        TopbarBg = Color3.fromRGB(24, 24, 28),
+        CardBg = Color3.fromRGB(38, 38, 46),
+        Accent = Color3.fromRGB(255, 200, 0),
+        Text = Color3.fromRGB(245, 245, 250),
+        SubText = Color3.fromRGB(150, 150, 165),
+        Border = Color3.fromRGB(48, 48, 58),
+        Glow = Color3.fromRGB(255, 200, 0),
+    },
+    ["Midnight (Синяя)"] = {
+        MainBg = Color3.fromRGB(15, 18, 28),
+        SidebarBg = Color3.fromRGB(20, 25, 40),
+        TopbarBg = Color3.fromRGB(18, 22, 35),
+        CardBg = Color3.fromRGB(30, 38, 58),
+        Accent = Color3.fromRGB(0, 170, 255),
+        Text = Color3.fromRGB(240, 245, 255),
+        SubText = Color3.fromRGB(140, 160, 190),
+        Border = Color3.fromRGB(40, 52, 78),
+        Glow = Color3.fromRGB(0, 170, 255),
+    },
+    ["Purple (Фиолетовая)"] = {
+        MainBg = Color3.fromRGB(22, 16, 28),
+        SidebarBg = Color3.fromRGB(30, 22, 40),
+        TopbarBg = Color3.fromRGB(25, 18, 32),
+        CardBg = Color3.fromRGB(42, 30, 56),
+        Accent = Color3.fromRGB(180, 70, 255),
+        Text = Color3.fromRGB(250, 240, 255),
+        SubText = Color3.fromRGB(170, 140, 190),
+        Border = Color3.fromRGB(55, 38, 75),
+        Glow = Color3.fromRGB(180, 70, 255),
+    },
+    ["Emerald (Изумрудная)"] = {
+        MainBg = Color3.fromRGB(16, 24, 20),
+        SidebarBg = Color3.fromRGB(22, 34, 28),
+        TopbarBg = Color3.fromRGB(18, 28, 23),
+        CardBg = Color3.fromRGB(30, 48, 38),
+        Accent = Color3.fromRGB(0, 230, 120),
+        Text = Color3.fromRGB(240, 255, 245),
+        SubText = Color3.fromRGB(140, 190, 160),
+        Border = Color3.fromRGB(40, 68, 52),
+        Glow = Color3.fromRGB(0, 230, 120),
+    },
+    ["Crimson (Красная)"] = {
+        MainBg = Color3.fromRGB(26, 16, 18),
+        SidebarBg = Color3.fromRGB(40, 20, 22),
+        TopbarBg = Color3.fromRGB(32, 18, 20),
+        CardBg = Color3.fromRGB(58, 30, 34),
+        Accent = Color3.fromRGB(255, 55, 75),
+        Text = Color3.fromRGB(255, 245, 245),
+        SubText = Color3.fromRGB(200, 150, 155),
+        Border = Color3.fromRGB(75, 38, 42),
+        Glow = Color3.fromRGB(255, 55, 75),
+    },
+    ["Gold (Золотая)"] = {
+        MainBg = Color3.fromRGB(24, 22, 18),
+        SidebarBg = Color3.fromRGB(32, 28, 20),
+        TopbarBg = Color3.fromRGB(28, 24, 18),
+        CardBg = Color3.fromRGB(48, 40, 28),
+        Accent = Color3.fromRGB(255, 190, 40),
+        Text = Color3.fromRGB(255, 250, 240),
+        SubText = Color3.fromRGB(200, 180, 150),
+        Border = Color3.fromRGB(68, 58, 38),
+        Glow = Color3.fromRGB(255, 190, 40),
+    },
+    ["Cyber (Неоновая)"] = {
+        MainBg = Color3.fromRGB(10, 8, 20),
+        SidebarBg = Color3.fromRGB(16, 12, 30),
+        TopbarBg = Color3.fromRGB(12, 10, 25),
+        CardBg = Color3.fromRGB(25, 20, 45),
+        Accent = Color3.fromRGB(0, 255, 255),
+        Text = Color3.fromRGB(200, 255, 255),
+        SubText = Color3.fromRGB(120, 200, 200),
+        Border = Color3.fromRGB(40, 35, 70),
+        Glow = Color3.fromRGB(0, 255, 255),
+    },
+    ["Pink (Розовая)"] = {
+        MainBg = Color3.fromRGB(28, 18, 26),
+        SidebarBg = Color3.fromRGB(40, 24, 36),
+        TopbarBg = Color3.fromRGB(34, 20, 30),
+        CardBg = Color3.fromRGB(58, 34, 50),
+        Accent = Color3.fromRGB(255, 80, 180),
+        Text = Color3.fromRGB(255, 240, 250),
+        SubText = Color3.fromRGB(200, 150, 180),
+        Border = Color3.fromRGB(75, 42, 65),
+        Glow = Color3.fromRGB(255, 80, 180),
+    },
+    ["Ocean (Океанская)"] = {
+        MainBg = Color3.fromRGB(10, 20, 30),
+        SidebarBg = Color3.fromRGB(14, 28, 42),
+        TopbarBg = Color3.fromRGB(12, 24, 36),
+        CardBg = Color3.fromRGB(22, 42, 58),
+        Accent = Color3.fromRGB(0, 200, 255),
+        Text = Color3.fromRGB(200, 240, 255),
+        SubText = Color3.fromRGB(120, 180, 210),
+        Border = Color3.fromRGB(32, 58, 78),
+        Glow = Color3.fromRGB(0, 200, 255),
+    },
+    ["Forest (Лесная)"] = {
+        MainBg = Color3.fromRGB(14, 22, 16),
+        SidebarBg = Color3.fromRGB(20, 32, 22),
+        TopbarBg = Color3.fromRGB(16, 26, 18),
+        CardBg = Color3.fromRGB(30, 48, 34),
+        Accent = Color3.fromRGB(80, 220, 100),
+        Text = Color3.fromRGB(220, 255, 220),
+        SubText = Color3.fromRGB(140, 200, 150),
+        Border = Color3.fromRGB(42, 68, 46),
+        Glow = Color3.fromRGB(80, 220, 100),
+    },
+    ["Blood (Кровавая)"] = {
+        MainBg = Color3.fromRGB(20, 8, 8),
+        SidebarBg = Color3.fromRGB(35, 12, 12),
+        TopbarBg = Color3.fromRGB(28, 10, 10),
+        CardBg = Color3.fromRGB(55, 20, 20),
+        Accent = Color3.fromRGB(255, 20, 20),
+        Text = Color3.fromRGB(255, 220, 220),
+        SubText = Color3.fromRGB(200, 130, 130),
+        Border = Color3.fromRGB(75, 28, 28),
+        Glow = Color3.fromRGB(255, 20, 20),
+    },
+    ["Galaxy (Галактика)"] = {
+        MainBg = Color3.fromRGB(12, 8, 25),
+        SidebarBg = Color3.fromRGB(18, 12, 35),
+        TopbarBg = Color3.fromRGB(14, 10, 30),
+        CardBg = Color3.fromRGB(28, 20, 50),
+        Accent = Color3.fromRGB(180, 60, 255),
+        Text = Color3.fromRGB(240, 220, 255),
+        SubText = Color3.fromRGB(160, 130, 200),
+        Border = Color3.fromRGB(45, 30, 75),
+        Glow = Color3.fromRGB(180, 60, 255),
+    }
+}
+
+local currentThemeName = "Dark (Черная)"
+local COLORS = THEMES[currentThemeName]
+
+local themeElements = {
+    Main = {}, Sidebar = {}, Topbar = {}, Cards = {}, Accents = {}, Texts = {}, SubTexts = {}, Glows = {}
+}
+
+local function applyTheme(themeName)
+    local t = THEMES[themeName]
+    if not t then return end
+    COLORS = t
+    currentThemeName = themeName
+    
+    for _, elem in ipairs(themeElements.Main) do 
+        TweenService:Create(elem, TweenInfo.new(0.3), {BackgroundColor3 = t.MainBg}):Play()
+    end
+    for _, elem in ipairs(themeElements.Sidebar) do 
+        TweenService:Create(elem, TweenInfo.new(0.3), {BackgroundColor3 = t.SidebarBg}):Play()
+    end
+    for _, elem in ipairs(themeElements.Topbar) do 
+        TweenService:Create(elem, TweenInfo.new(0.3), {BackgroundColor3 = t.TopbarBg}):Play()
+    end
+    for _, elem in ipairs(themeElements.Cards) do 
+        TweenService:Create(elem, TweenInfo.new(0.3), {BackgroundColor3 = t.CardBg}):Play()
+    end
+    for _, elem in ipairs(themeElements.Accents) do 
+        if elem:IsA("TextLabel") or elem:IsA("TextButton") then
+            TweenService:Create(elem, TweenInfo.new(0.3), {TextColor3 = t.Accent}):Play()
+        else
+            TweenService:Create(elem, TweenInfo.new(0.3), {BackgroundColor3 = t.Accent}):Play()
+        end
+    end
+    for _, elem in ipairs(themeElements.Texts) do 
+        TweenService:Create(elem, TweenInfo.new(0.3), {TextColor3 = t.Text}):Play()
+    end
+    for _, elem in ipairs(themeElements.SubTexts) do 
+        TweenService:Create(elem, TweenInfo.new(0.3), {TextColor3 = t.SubText}):Play()
+    end
+    for _, elem in ipairs(themeElements.Glows) do 
+        TweenService:Create(elem, TweenInfo.new(0.3), {ImageColor3 = t.Glow}):Play()
+    end
+end
+
+-- ============================================
+-- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+-- ============================================
+local function canExecuteAction()
+    local char = LocalPlayer.Character
+    if not char then return false end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    return hum and hum.Health > 0
+end
+
+local function getMyPosition()
+    local char = LocalPlayer.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    return root and root.Position
+end
+
+local function getEquippedToolName()
+    local char = LocalPlayer.Character
+    local tool = char and char:FindFirstChildOfClass("Tool")
+    return tool and tool.Name or ""
+end
+
+local function autoDiscoverItemID(toolName)
+    return fruitToItemID[toolName] or 0
+end
+
+local function sendHitPacket(swingData)
+    local p = getgenv().packets or _G.packets
+    if p and p.Swing and p.Swing.send then
+        p.Swing.send(swingData)
+    end
+end
+
+local function getWorkspaceResources()
+    return Workspace:FindFirstChild("Resources") or Workspace:FindFirstChild("Nodes") or Workspace
+end
+
+-- ============================================
+-- RESOURCE AURA
+-- ============================================
+function ResourseAura()
+    if not (Settings.Aura and Settings.Aura.Resource) then return end
+    if not canExecuteAction() then return end
+
+    local myPos = getMyPosition()
+    if not myPos then return end
+
+    local range = Settings.Aura.Range or 20
+    local hitLimit = Settings.Aura.ResourceAuraSpeed or 1
+    local filterName = Settings.Aura.ResourceFilter or "All"
+    local hitsDone = 0
+
+    local toolName = getEquippedToolName()
+    local itemID = autoDiscoverItemID(toolName)
+
+    local swingData = {
+        toolName = toolName,
+        itemID = itemID,
+        hitType = "Resource",
+        myPos = myPos,
+    }
+
+    local resourcesFolder = getWorkspaceResources()
+    if not resourcesFolder then return end
+
+    for _, res in ipairs(resourcesFolder:GetChildren()) do
+        if hitsDone >= hitLimit then break end
+
+        local resName = res.Name
+        local isMatch = (filterName == "All") or (string.lower(resName) == string.lower(filterName))
+        if isMatch then
+            local part = res:IsA("BasePart") and res or res:FindFirstChildWhichIsA("BasePart", true)
+            if part then
+                local dist = (part.Position - myPos).Magnitude
+                if dist <= range then
+                    swingData.targetPart = part
+                    swingData.targetPos = part.Position
+                    swingData.entityID = res:GetAttribute("EntityID") or res:GetAttribute("ID")
+
+                    sendHitPacket(swingData)
+                    hitsDone = hitsDone + 1
+                end
+            end
+        end
+    end
+end
+
+task.spawn(function()
+    while true do
+        if Settings.Aura.Resource then
+            pcall(ResourseAura)
+        end
+        task.wait(0.1)
+    end
+end)
+
+-- ============================================
+-- AUTO FARM (ПОСАДКА/СБОР)
+-- ============================================
+local function farm_getPlantBoxes(range)
+    local boxes = {}
+    local deployables = Workspace:FindFirstChild("Deployables")
+    if not deployables then return boxes end
+    
+    local root = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+    if not root then return boxes end
+    
+    for _, dep in ipairs(deployables:GetChildren()) do
+        if dep:IsA("Model") and dep.Name == "Plant Box" then
+            local eid = dep:GetAttribute("EntityID")
+            local part = dep.PrimaryPart or dep:FindFirstChildWhichIsA("BasePart")
+            if eid and part then
+                local dist = (part.Position - root.Position).Magnitude
+                if dist <= range then
+                    table.insert(boxes, { eid = eid, dep = dep, dist = dist })
+                end
+            end
+        end
+    end
+    return boxes
+end
+
+local function farm_getBushes(range, fruit)
+    local bushes = {}
+    local root = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+    if not root then return bushes end
+    
+    for _, model in ipairs(Workspace:GetChildren()) do
+        if model:IsA("Model") and model.Name:find(fruit) then
+            local part = model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart")
+            if part then
+                local dist = (part.Position - root.Position).Magnitude
+                if dist <= range then
+                    local eid = model:GetAttribute("EntityID")
+                    if eid then
+                        table.insert(bushes, { eid = eid, dist = dist })
+                    end
+                end
+            end
+        end
+    end
+    return bushes
+end
+
+local function farm_plantSeed(eid, itemID)
+    local p = getgenv().packets or _G.packets
+    if p and p.InteractStructure and p.InteractStructure.send then
+        p.InteractStructure.send({ entityID = eid, itemID = itemID })
+        plantedBoxes[eid] = tick()
+    end
+end
+
+local function farm_harvestBush(eid)
+    local p = getgenv().packets or _G.packets
+    if p and p.Pickup and p.Pickup.send then
+        p.Pickup.send(eid)
+    end
+end
+
+-- ============================================
+-- HITBOX
+-- ============================================
+local function updateHitboxes()
+    for _, v in pairs(Players:GetPlayers()) do
+        if v ~= LocalPlayer and v.Character then
+            local hrp = v.Character:FindFirstChild("HumanoidRootPart")
+            if hrp then
+                if hitboxEnabled then
+                    hrp.Size = Vector3.new(hitboxSize, hitboxSize, hitboxSize)
+                    
+                    for _, child in pairs(hrp:GetChildren()) do
+                        if child:IsA("SelectionBox") or child:IsA("BoxHandleAdornment") then
+                            child:Destroy()
+                        end
+                    end
+                    
+                    local box = Instance.new("SelectionBox")
+                    box.Adornee = hrp
+                    box.LineThickness = 0.15
+                    box.Color3 = Color3.new(1, 0, 0)
+                    box.Transparency = 0.5
+                    box.Parent = hrp
+                else
+                    hrp.Size = Vector3.new(2, 2, 1)
+                    for _, child in pairs(hrp:GetChildren()) do
+                        if child:IsA("SelectionBox") or child:IsA("BoxHandleAdornment") then
+                            child:Destroy()
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+
+task.spawn(function()
+    while true do
+        task.wait(3)
+        if hitboxEnabled then
+            updateHitboxes()
+        end
+    end
+end)
+
+Players.PlayerAdded:Connect(function(p)
+    p.CharacterAdded:Connect(function()
+        task.wait(0.5)
+        if hitboxEnabled then
+            updateHitboxes()
+        end
+    end)
+end)
+
+-- ============================================
+-- SPEED
+-- ============================================
+local function updateSpeed()
+    local char = LocalPlayer.Character
+    if not char then return end
+    
+    local humanoid = char:FindFirstChildOfClass("Humanoid")
+    if not humanoid then return end
+    
+    if SpeedEnabled then
+        humanoid.WalkSpeed = TargetWalkSpeed
+        humanoid:ChangeState(Enum.HumanoidStateType.Running)
+    else
+        humanoid.WalkSpeed = DefaultWalkSpeed
+    end
+end
+
+LocalPlayer.CharacterAdded:Connect(function(char)
+    local humanoid = char:WaitForChild("Humanoid")
+    task.wait(0.5)
+    updateSpeed()
+end)
+
+RunService.Heartbeat:Connect(function()
+    if SpeedEnabled then
+        local char = LocalPlayer.Character
+        if char then
+            local humanoid = char:FindFirstChildOfClass("Humanoid")
+            if humanoid and humanoid.WalkSpeed ~= TargetWalkSpeed then
+                humanoid.WalkSpeed = TargetWalkSpeed
+            end
+        end
+    end
+end)
+
+-- ============================================
+-- INFINITE JUMP
+-- ============================================
+UserInputService.JumpRequest:Connect(function()
+    if InfiniteJumpEnabled and LocalPlayer.Character then
+        local humanoid = LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+        if humanoid then
+            humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+        end
+    end
+end)
+
+-- ============================================
+-- СОЗДАНИЕ GUI
+-- ============================================
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "VoidHubGui"
+screenGui.ResetOnSpawn = false
+screenGui.Parent = PlayerGui
+
+-- Главная рамка
+local mainFrame = Instance.new("Frame")
+mainFrame.Name = "MainFrame"
+mainFrame.Size = UDim2.new(0, 520, 0, 430)
+mainFrame.Position = UDim2.new(0.5, -260, 0.5, -215)
+mainFrame.BackgroundColor3 = COLORS.MainBg
+mainFrame.BackgroundTransparency = 0.15
+mainFrame.BorderSizePixel = 0
+mainFrame.Active = true
+mainFrame.Draggable = true
+mainFrame.Parent = screenGui
+table.insert(themeElements.Main, mainFrame)
+
+local mainCorner = Instance.new("UICorner")
+mainCorner.CornerRadius = UDim.new(0, 12)
+mainCorner.Parent = mainFrame
+
+local mainStroke = Instance.new("UIStroke")
+mainStroke.Color = COLORS.Border
+mainStroke.Transparency = 0.8
+mainStroke.Thickness = 1
+mainStroke.Parent = mainFrame
+
+-- Боковая панель
+local sidebar = Instance.new("Frame")
+sidebar.Name = "Sidebar"
+sidebar.Size = UDim2.new(0, 130, 1, 0)
+sidebar.BackgroundColor3 = COLORS.SidebarBg
+sidebar.BackgroundTransparency = 0.4
+sidebar.BorderSizePixel = 0
+sidebar.Parent = mainFrame
+table.insert(themeElements.Sidebar, sidebar)
+
+local sidebarCorner = Instance.new("UICorner")
+sidebarCorner.CornerRadius = UDim.new(0, 12)
+sidebarCorner.Parent = sidebar
+
+-- Логотип
+local logoFrame = Instance.new("Frame")
+logoFrame.Name = "LogoFrame"
+logoFrame.Size = UDim2.new(0, 100, 0, 40)
+logoFrame.Position = UDim2.new(0, 15, 0, 10)
+logoFrame.BackgroundColor3 = COLORS.CardBg
+logoFrame.BackgroundTransparency = 0.3
+logoFrame.Parent = sidebar
+table.insert(themeElements.Cards, logoFrame)
+
+local logoCorner = Instance.new("UICorner")
+logoCorner.CornerRadius = UDim.new(0, 8)
+logoCorner.Parent = logoFrame
+
+local logoText = Instance.new("TextLabel")
+logoText.Size = UDim2.new(1, 0, 1, 0)
+logoText.BackgroundTransparency = 1
+logoText.Text = "VH"
+logoText.TextColor3 = COLORS.Text
+logoText.TextSize = 20
+logoText.Font = Enum.Font.GothamBold
+logoText.Parent = logoFrame
+table.insert(themeElements.Texts, logoText)
+
+-- Свечение логотипа
+local glowCircle = Instance.new("ImageLabel")
+glowCircle.Size = UDim2.new(1.5, 0, 1.5, 0)
+glowCircle.Position = UDim2.new(-0.25, 0, -0.25, 0)
+glowCircle.BackgroundTransparency = 1
+glowCircle.Image = "rbxassetid://5607217037"
+glowCircle.ImageColor3 = COLORS.Glow
+glowCircle.ImageTransparency = 0.5
+glowCircle.Parent = logoFrame
+table.insert(themeElements.Glows, glowCircle)
+
+-- Навигация
+local navList = Instance.new("Frame")
+navList.Name = "NavList"
+navList.Size = UDim2.new(1, -20, 1, -65)
+navList.Position = UDim2.new(0, 10, 0, 60)
+navList.BackgroundTransparency = 1
+navList.Parent = sidebar
+
+local listLayout = Instance.new("UIListLayout")
+listLayout.Padding = UDim.new(0, 6)
+listLayout.SortOrder = Enum.SortOrder.LayoutOrder
+listLayout.Parent = navList
+
+-- Шапка
+local header = Instance.new("Frame")
+header.Name = "Header"
+header.Size = UDim2.new(1, -140, 0, 45)
+header.Position = UDim2.new(0, 140, 0, 0)
+header.BackgroundTransparency = 1
+header.Parent = mainFrame
+
+local titleLabel = Instance.new("TextLabel")
+titleLabel.Text = "Void hub"
+titleLabel.Size = UDim2.new(0, 100, 1, 0)
+titleLabel.Position = UDim2.new(0, 5, 0, 0)
+titleLabel.BackgroundTransparency = 1
+titleLabel.TextColor3 = COLORS.Text
+titleLabel.Font = Enum.Font.GothamBold
+titleLabel.TextSize = 18
+titleLabel.TextXAlignment = Enum.TextXAlignment.Left
+titleLabel.Parent = header
+table.insert(themeElements.Texts, titleLabel)
+
+local tagLabel = Instance.new("TextLabel")
+tagLabel.Text = "v3.0"
+tagLabel.Size = UDim2.new(0, 50, 1, 0)
+tagLabel.Position = UDim2.new(0, 105, 0, 0)
+tagLabel.BackgroundTransparency = 1
+tagLabel.TextColor3 = COLORS.SubText
+tagLabel.Font = Enum.Font.Gotham
+tagLabel.TextSize = 13
+tagLabel.TextXAlignment = Enum.TextXAlignment.Left
+tagLabel.Parent = header
+table.insert(themeElements.SubTexts, tagLabel)
+
+-- Индикатор клавиши
+local keyIndicator = Instance.new("TextButton")
+keyIndicator.Size = UDim2.new(0, 80, 1, 0)
+keyIndicator.Position = UDim2.new(1, -85, 0, 0)
+keyIndicator.BackgroundColor3 = COLORS.CardBg
+keyIndicator.BackgroundTransparency = 0.3
+keyIndicator.Text = "🔑 " .. tostring(guiOpenKey.Name)
+keyIndicator.TextColor3 = COLORS.SubText
+keyIndicator.Font = Enum.Font.Gotham
+keyIndicator.TextSize = 10
+keyIndicator.Parent = header
+table.insert(themeElements.Cards, keyIndicator)
+
+local keyCorner = Instance.new("UICorner")
+keyCorner.CornerRadius = UDim.new(0, 4)
+keyCorner.Parent = keyIndicator
+
+-- Линия
+local divider = Instance.new("Frame")
+divider.Size = UDim2.new(1, -145, 0, 1)
+divider.Position = UDim2.new(0, 135, 0, 45)
+divider.BackgroundColor3 = COLORS.Border
+divider.BackgroundTransparency = 0.85
+divider.BorderSizePixel = 0
+divider.Parent = mainFrame
+
+-- Область контента
+local contentArea = Instance.new("Frame")
+contentArea.Name = "ContentArea"
+contentArea.Size = UDim2.new(1, -145, 1, -55)
+contentArea.Position = UDim2.new(0, 140, 0, 50)
+contentArea.BackgroundTransparency = 1
+contentArea.Parent = mainFrame
+
+local pages = {}
+
+local function createPage(name)
+    local page = Instance.new("ScrollingFrame")
+    page.Name = name .. "Page"
+    page.Size = UDim2.new(1, -5, 1, -5)
+    page.Position = UDim2.new(0, 0, 0, 0)
+    page.BackgroundTransparency = 1
+    page.Visible = false
+    page.BorderSizePixel = 0
+    page.ScrollBarThickness = 3
+    page.CanvasSize = UDim2.new(0, 0, 0, 0)
+    page.Parent = contentArea
+
+    local pageLayout = Instance.new("UIListLayout")
+    pageLayout.Padding = UDim.new(0, 8)
+    pageLayout.SortOrder = Enum.SortOrder.LayoutOrder
+    pageLayout.Parent = page
+
+    pageLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+        page.CanvasSize = UDim2.new(0, 0, 0, pageLayout.AbsoluteContentSize.Y + 10)
+    end)
+
+    pages[name] = page
+    return page
+end
+
+local pvpPage = createPage("PvP")
+local playerPage = createPage("Player")
+local miscPage = createPage("Misc")
+local goldPage = createPage("Gold Farm")
+local settingPage = createPage("Setting")
+
+local function showPage(pageName)
+    for name, page in pairs(pages) do
+        page.Visible = (name == pageName)
+    end
+end
+
+-- Навигационные кнопки
+local function createNavButton(text, order)
+    local btn = Instance.new("TextButton")
+    btn.Name = text .. "Btn"
+    btn.Size = UDim2.new(1, 0, 0, 32)
+    btn.BackgroundColor3 = COLORS.CardBg
+    btn.BackgroundTransparency = 0.5
+    btn.Text = text
+    btn.TextColor3 = COLORS.SubText
+    btn.Font = Enum.Font.GothamMedium
+    btn.TextSize = 13
+    btn.LayoutOrder = order
+    btn.Parent = navList
+    table.insert(themeElements.Cards, btn)
+
+    local btnCorner = Instance.new("UICorner")
+    btnCorner.CornerRadius = UDim.new(0, 6)
+    btnCorner.Parent = btn
+
+    local btnStroke = Instance.new("UIStroke")
+    btnStroke.Color = COLORS.Border
+    btnStroke.Transparency = 0.9
+    btnStroke.Parent = btn
+
+    btn.MouseEnter:Connect(function()
+        TweenService:Create(btn, TweenInfo.new(0.2), {
+            BackgroundTransparency = 0.2, 
+            TextColor3 = COLORS.Text
+        }):Play()
+    end)
+    btn.MouseLeave:Connect(function()
+        TweenService:Create(btn, TweenInfo.new(0.2), {
+            BackgroundTransparency = 0.5, 
+            TextColor3 = COLORS.SubText
+        }):Play()
+    end)
+
+    btn.MouseButton1Click:Connect(function()
+        showPage(text)
+        TweenService:Create(btn, TweenInfo.new(0.1), {Size = UDim2.new(1, -5, 0, 28)}):Play()
+        task.wait(0.1)
+        TweenService:Create(btn, TweenInfo.new(0.1), {Size = UDim2.new(1, 0, 0, 32)}):Play()
+    end)
+
+    return btn
+end
+
+createNavButton("PvP", 1)
+createNavButton("Player", 2)
+createNavButton("Misc", 3)
+createNavButton("Gold Farm", 4)
+createNavButton("Setting", 5)
+
+-- ============================================
+-- КОМПОНЕНТЫ GUI
+-- ============================================
+
+-- Toggle
+local function createToggle(parent, text, defaultState, callback)
+    local state = defaultState or false
+
+    local toggleFrame = Instance.new("Frame")
+    toggleFrame.Size = UDim2.new(1, -10, 0, 38)
+    toggleFrame.BackgroundColor3 = COLORS.CardBg
+    toggleFrame.BackgroundTransparency = 0.4
+    toggleFrame.Parent = parent
+    table.insert(themeElements.Cards, toggleFrame)
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 8)
+    corner.Parent = toggleFrame
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = COLORS.Border
+    stroke.Transparency = 0.9
+    stroke.Parent = toggleFrame
+
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(1, -60, 1, 0)
+    label.Position = UDim2.new(0, 10, 0, 0)
+    label.BackgroundTransparency = 1
+    label.Text = text
+    label.TextColor3 = COLORS.Text
+    label.Font = Enum.Font.GothamMedium
+    label.TextSize = 13
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.Parent = toggleFrame
+    table.insert(themeElements.Texts, label)
+
+    local toggleBtn = Instance.new("TextButton")
+    toggleBtn.Size = UDim2.new(0, 36, 0, 20)
+    toggleBtn.Position = UDim2.new(1, -46, 0.5, -10)
+    toggleBtn.BackgroundColor3 = state and COLORS.Accent or Color3.fromRGB(60, 60, 70)
+    toggleBtn.Text = ""
+    toggleBtn.AutoButtonColor = false
+    toggleBtn.Parent = toggleFrame
+
+    local btnCorner = Instance.new("UICorner")
+    btnCorner.CornerRadius = UDim.new(1, 0)
+    btnCorner.Parent = toggleBtn
+
+    local circle = Instance.new("Frame")
+    circle.Size = UDim2.new(0, 14, 0, 14)
+    circle.Position = state and UDim2.new(1, -17, 0.5, -7) or UDim2.new(0, 3, 0.5, -7)
+    circle.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+    circle.Parent = toggleBtn
+
+    local circleCorner = Instance.new("UICorner")
+    circleCorner.CornerRadius = UDim.new(1, 0)
+    circleCorner.Parent = circle
+
+    toggleBtn.MouseButton1Click:Connect(function()
+        state = not state
+        local targetBg = state and COLORS.Accent or Color3.fromRGB(60, 60, 70)
+        local targetPos = state and UDim2.new(1, -17, 0.5, -7) or UDim2.new(0, 3, 0.5, -7)
+
+        TweenService:Create(toggleBtn, TweenInfo.new(0.2), {BackgroundColor3 = targetBg}):Play()
+        TweenService:Create(circle, TweenInfo.new(0.2), {Position = targetPos}):Play()
+
+        callback(state)
+    end)
+end
+
+-- Slider
+local function createSlider(parent, text, min, max, default, callback)
+    local sliderFrame = Instance.new("Frame")
+    sliderFrame.Size = UDim2.new(1, -10, 0, 48)
+    sliderFrame.BackgroundColor3 = COLORS.CardBg
+    sliderFrame.BackgroundTransparency = 0.4
+    sliderFrame.Parent = parent
+    table.insert(themeElements.Cards, sliderFrame)
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 8)
+    corner.Parent = sliderFrame
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = COLORS.Border
+    stroke.Transparency = 0.9
+    stroke.Parent = sliderFrame
+
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(0.6, 0, 0, 22)
+    label.Position = UDim2.new(0, 10, 0, 4)
+    label.BackgroundTransparency = 1
+    label.Text = text
+    label.TextColor3 = COLORS.Text
+    label.Font = Enum.Font.GothamMedium
+    label.TextSize = 13
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.Parent = sliderFrame
+    table.insert(themeElements.Texts, label)
+
+    local valueLabel = Instance.new("TextLabel")
+    valueLabel.Size = UDim2.new(0.3, 0, 0, 22)
+    valueLabel.Position = UDim2.new(0.7, -10, 0, 4)
+    valueLabel.BackgroundTransparency = 1
+    valueLabel.Text = tostring(default)
+    valueLabel.TextColor3 = COLORS.Accent
+    valueLabel.Font = Enum.Font.Gotham
+    valueLabel.TextSize = 13
+    valueLabel.TextXAlignment = Enum.TextXAlignment.Right
+    valueLabel.Parent = sliderFrame
+    table.insert(themeElements.Accents, valueLabel)
+
+    local bar = Instance.new("Frame")
+    bar.Size = UDim2.new(1, -20, 0, 6)
+    bar.Position = UDim2.new(0, 10, 1, -12)
+    bar.BackgroundColor3 = Color3.fromRGB(60, 60, 70)
+    bar.BorderSizePixel = 0
+    bar.Parent = sliderFrame
+
+    local barCorner = Instance.new("UICorner")
+    barCorner.CornerRadius = UDim.new(1, 0)
+    barCorner.Parent = bar
+
+    local fill = Instance.new("Frame")
+    local startPercent = math.clamp((default - min) / (max - min), 0, 1)
+    fill.Size = UDim2.new(startPercent, 0, 1, 0)
+    fill.BackgroundColor3 = COLORS.Accent
+    fill.BorderSizePixel = 0
+    fill.Parent = bar
+    table.insert(themeElements.Accents, fill)
+
+    local fillCorner = Instance.new("UICorner")
+    fillCorner.CornerRadius = UDim.new(1, 0)
+    fillCorner.Parent = fill
+
+    local isDragging = false
+
+    local function updateValue(input)
+        local barAbsPos = bar.AbsolutePosition.X
+        local barAbsSize = bar.AbsoluteSize.X
+        local mousePos = input.Position.X
+        local percent = math.clamp((mousePos - barAbsPos) / barAbsSize, 0, 1)
+        
+        local rawVal = min + (max - min) * percent
+        local value = math.floor(rawVal + 0.5)
+
+        fill.Size = UDim2.new(percent, 0, 1, 0)
+        valueLabel.Text = tostring(value)
+        callback(value)
+    end
+
+    sliderFrame.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            isDragging = true
+            updateValue(input)
+        end
+    end)
+
+    sliderFrame.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            isDragging = false
+        end
+    end)
+
+    UserInputService.InputChanged:Connect(function(input)
+        if isDragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+            updateValue(input)
+        end
+    end)
+end
+
+-- Dropdown
+local function createDropdown(parent, text, options, default, callback)
+    local isExpanded = false
+    local selected = default or options[1]
+
+    local dropContainer = Instance.new("Frame")
+    dropContainer.Size = UDim2.new(1, -10, 0, 38)
+    dropContainer.BackgroundColor3 = COLORS.CardBg
+    dropContainer.BackgroundTransparency = 0.4
+    dropContainer.ClipsDescendants = true
+    dropContainer.Parent = parent
+    table.insert(themeElements.Cards, dropContainer)
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 8)
+    corner.Parent = dropContainer
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = COLORS.Border
+    stroke.Transparency = 0.9
+    stroke.Parent = dropContainer
+
+    local mainBtn = Instance.new("TextButton")
+    mainBtn.Size = UDim2.new(1, 0, 0, 38)
+    mainBtn.BackgroundTransparency = 1
+    mainBtn.Text = ""
+    mainBtn.Parent = dropContainer
+
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(0.5, 0, 1, 0)
+    label.Position = UDim2.new(0, 10, 0, 0)
+    label.BackgroundTransparency = 1
+    label.Text = text
+    label.TextColor3 = COLORS.Text
+    label.Font = Enum.Font.GothamMedium
+    label.TextSize = 13
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.Parent = mainBtn
+    table.insert(themeElements.Texts, label)
+
+    local selectedLabel = Instance.new("TextLabel")
+    selectedLabel.Size = UDim2.new(0.45, -15, 1, 0)
+    selectedLabel.Position = UDim2.new(0.55, -10, 0, 0)
+    selectedLabel.BackgroundTransparency = 1
+    selectedLabel.Text = selected .. " ▾"
+    selectedLabel.TextColor3 = COLORS.Accent
+    selectedLabel.Font = Enum.Font.Gotham
+    selectedLabel.TextSize = 13
+    selectedLabel.TextXAlignment = Enum.TextXAlignment.Right
+    selectedLabel.Parent = mainBtn
+    table.insert(themeElements.Accents, selectedLabel)
+
+    local listFrame = Instance.new("Frame")
+    listFrame.Size = UDim2.new(1, -10, 0, 0)
+    listFrame.Position = UDim2.new(0, 5, 0, 40)
+    listFrame.BackgroundTransparency = 1
+    listFrame.Parent = dropContainer
+
+    local listLayout = Instance.new("UIListLayout")
+    listLayout.Padding = UDim.new(0, 3)
+    listLayout.Parent = listFrame
+
+    local function refreshDropdown()
+        for _, child in ipairs(listFrame:GetChildren()) do
+            if child:IsA("TextButton") then child:Destroy() end
+        end
+
+        for _, opt in ipairs(options) do
+            local optBtn = Instance.new("TextButton")
+            optBtn.Size = UDim2.new(1, 0, 0, 26)
+            optBtn.BackgroundColor3 = Color3.fromRGB(25, 25, 35)
+            optBtn.BackgroundTransparency = 0.3
+            optBtn.Text = opt
+            optBtn.TextColor3 = (opt == selected) and COLORS.Accent or COLORS.SubText
+            optBtn.Font = Enum.Font.Gotham
+            optBtn.TextSize = 12
+            optBtn.Parent = listFrame
+
+            local optCorner = Instance.new("UICorner")
+            optCorner.CornerRadius = UDim.new(0, 4)
+            optCorner.Parent = optBtn
+
+            optBtn.MouseButton1Click:Connect(function()
+                selected = opt
+                selectedLabel.Text = selected .. " ▾"
+                isExpanded = false
+                TweenService:Create(dropContainer, TweenInfo.new(0.2), {Size = UDim2.new(1, -10, 0, 38)}):Play()
+                callback(selected)
+                refreshDropdown()
+            end)
+        end
+    end
+
+    refreshDropdown()
+
+    mainBtn.MouseButton1Click:Connect(function()
+        isExpanded = not isExpanded
+        local totalHeight = isExpanded and (42 + (#options * 29)) or 38
+        TweenService:Create(dropContainer, TweenInfo.new(0.2), {Size = UDim2.new(1, -10, 0, totalHeight)}):Play()
+    end)
+end
+
+-- Button
+local function createButton(parent, text, callback)
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(1, -10, 0, 36)
+    btn.BackgroundColor3 = COLORS.CardBg
+    btn.BackgroundTransparency = 0.4
+    btn.Text = text
+    btn.TextColor3 = COLORS.Text
+    btn.Font = Enum.Font.GothamMedium
+    btn.TextSize = 13
+    btn.Parent = parent
+    table.insert(themeElements.Cards, btn)
+
+    local btnCorner = Instance.new("UICorner")
+    btnCorner.CornerRadius = UDim.new(0, 8)
+    btnCorner.Parent = btn
+
+    local btnStroke = Instance.new("UIStroke")
+    btnStroke.Color = COLORS.Border
+    btnStroke.Transparency = 0.9
+    btnStroke.Parent = btn
+
+    btn.MouseEnter:Connect(function()
+        TweenService:Create(btn, TweenInfo.new(0.15), {
+            BackgroundTransparency = 0.2,
+            TextColor3 = COLORS.Accent
+        }):Play()
+    end)
+    btn.MouseLeave:Connect(function()
+        TweenService:Create(btn, TweenInfo.new(0.15), {
+            BackgroundTransparency = 0.4,
+            TextColor3 = COLORS.Text
+        }):Play()
+    end)
+
+    btn.MouseButton1Click:Connect(function()
+        TweenService:Create(btn, TweenInfo.new(0.1), {Size = UDim2.new(1, -15, 0, 32)}):Play()
+        task.wait(0.1)
+        TweenService:Create(btn, TweenInfo.new(0.1), {Size = UDim2.new(1, -10, 0, 36)}):Play()
+        callback()
+    end)
+end
+
+-- Input
+local function createInput(parent, text, placeholder, callback)
+    local inputFrame = Instance.new("Frame")
+    inputFrame.Size = UDim2.new(1, -10, 0, 38)
+    inputFrame.BackgroundColor3 = COLORS.CardBg
+    inputFrame.BackgroundTransparency = 0.4
+    inputFrame.Parent = parent
+    table.insert(themeElements.Cards, inputFrame)
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 8)
+    corner.Parent = inputFrame
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = COLORS.Border
+    stroke.Transparency = 0.9
+    stroke.Parent = inputFrame
+
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(0.3, 0, 1, 0)
+    label.Position = UDim2.new(0, 10, 0, 0)
+    label.BackgroundTransparency = 1
+    label.Text = text
+    label.TextColor3 = COLORS.Text
+    label.Font = Enum.Font.GothamMedium
+    label.TextSize = 12
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.Parent = inputFrame
+    table.insert(themeElements.Texts, label)
+
+    local inputBox = Instance.new("TextBox")
+    inputBox.Size = UDim2.new(0.65, -10, 0.8, 0)
+    inputBox.Position = UDim2.new(0.35, 0, 0.1, 0)
+    inputBox.BackgroundColor3 = Color3.fromRGB(25, 25, 35)
+    inputBox.BackgroundTransparency = 0.3
+    inputBox.PlaceholderText = placeholder or ""
+    inputBox.PlaceholderColor3 = COLORS.SubText
+    inputBox.TextColor3 = COLORS.Text
+    inputBox.Font = Enum.Font.Gotham
+    inputBox.TextSize = 12
+    inputBox.TextXAlignment = Enum.TextXAlignment.Left
+    inputBox.Parent = inputFrame
+    table.insert(themeElements.Texts, inputBox)
+
+    local inputCorner = Instance.new("UICorner")
+    inputCorner.CornerRadius = UDim.new(0, 4)
+    inputCorner.Parent = inputBox
+
+    inputBox.FocusLost:Connect(function(enterPressed)
+        if enterPressed then
+            callback(inputBox.Text)
+        end
+    end)
+end
+
+-- Bind Button
+local function createBindButton(parent, text, defaultKey, callback)
+    local bindFrame = Instance.new("Frame")
+    bindFrame.Size = UDim2.new(1, -10, 0, 38)
+    bindFrame.BackgroundColor3 = COLORS.CardBg
+    bindFrame.BackgroundTransparency = 0.4
+    bindFrame.Parent = parent
+    table.insert(themeElements.Cards, bindFrame)
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 8)
+    corner.Parent = bindFrame
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = COLORS.Border
+    stroke.Transparency = 0.9
+    stroke.Parent = bindFrame
+
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(0.5, 0, 1, 0)
+    label.Position = UDim2.new(0, 10, 0, 0)
+    label.BackgroundTransparency = 1
+    label.Text = text
+    label.TextColor3 = COLORS.Text
+    label.Font = Enum.Font.GothamMedium
+    label.TextSize = 12
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.Parent = bindFrame
+    table.insert(themeElements.Texts, label)
+
+    local keyBtn = Instance.new("TextButton")
+    keyBtn.Size = UDim2.new(0, 80, 0, 28)
+    keyBtn.Position = UDim2.new(1, -90, 0.5, -14)
+    keyBtn.BackgroundColor3 = COLORS.Accent
+    keyBtn.BackgroundTransparency = 0.3
+    keyBtn.Text = tostring(defaultKey.Name)
+    keyBtn.TextColor3 = COLORS.Text
+    keyBtn.Font = Enum.Font.GothamBold
+    keyBtn.TextSize = 12
+    keyBtn.Parent = bindFrame
+    table.insert(themeElements.Accents, keyBtn)
+
+    local keyCorner = Instance.new("UICorner")
+    keyCorner.CornerRadius = UDim.new(0, 4)
+    keyCorner.Parent = keyBtn
+
+    local isListening = false
+    
+    keyBtn.MouseButton1Click:Connect(function()
+        isListening = true
+        keyBtn.Text = "..."
+        TweenService:Create(keyBtn, TweenInfo.new(0.2), {
+            BackgroundColor3 = Color3.fromRGB(255, 50, 50),
+            Size = UDim2.new(0, 100, 0, 32)
+        }):Play()
+        
+        local connection
+        connection = UserInputService.InputBegan:Connect(function(input, gameProcessed)
+            if gameProcessed then return end
+            if input.KeyCode ~= Enum.KeyCode.Unknown then
+                isListening = false
+                keyBtn.Text = tostring(input.KeyCode.Name)
+                callback(input.KeyCode)
+                TweenService:Create(keyBtn, TweenInfo.new(0.2), {
+                    BackgroundColor3 = COLORS.Accent,
+                    Size = UDim2.new(0, 80, 0, 28)
+                }):Play()
+                connection:Disconnect()
+            end
+        end)
+    end)
+end
+
+-- ============================================
+-- ЗАПОЛНЕНИЕ ВКЛАДОК
+-- ============================================
+
+-- ===== PVP ВКЛАДКА =====
+createToggle(pvpPage, "Enable Hitbox", false, function(s)
+    hitboxEnabled = s
+    updateHitboxes()
+end)
+
+createSlider(pvpPage, "Hitbox Size", 1, 12, 1, function(v)
+    hitboxSize = v
+    if hitboxEnabled then
+        updateHitboxes()
+    end
+end)
+
+-- Auto Heal (из версии 1.0)
+createToggle(pvpPage, "Auto Heal", false, function(s)
+    heal_enabled = s
+    if s then
+        pcall(function()
+            StarterGui:SetCore("SendNotification", {
+                Title = "Auto Heal",
+                Text = "Включён | HP < " .. heal_threshold .. "%",
+                Duration = 2
+            })
+        end)
+    else
+        pcall(function()
+            StarterGui:SetCore("SendNotification", {
+                Title = "Auto Heal",
+                Text = "Выключен",
+                Duration = 1
+            })
+        end)
+    end
+end)
+
+createSlider(pvpPage, "Heal Health %", 1, 100, 30, function(v)
+    heal_threshold = v
+end)
+
+createSlider(pvpPage, "Heal CPS", 1, 75, 10, function(v)
+    heal_cps = v
+end)
+
+createDropdown(pvpPage, "Heal Fruit", heal_fruitList, "Bloodfruit", function(v)
+    heal_selectedFruit = v
+end)
+
+-- ===== PLAYER ВКЛАДКА =====
+createToggle(playerPage, "Infinite Jump", false, function(enabled)
+    InfiniteJumpEnabled = enabled
+end)
+
+createToggle(playerPage, "Enable Speed", false, function(enabled)
+    SpeedEnabled = enabled
+    updateSpeed()
+end)
+
+createSlider(playerPage, "WalkSpeed", 16, 32, 16, function(value)
+    TargetWalkSpeed = value
+    if SpeedEnabled then
+        updateSpeed()
+    end
+end)
+
+-- ===== MISC ВКЛАДКА =====
+createToggle(miscPage, "Resource Aura", false, function(s)
+    Settings.Aura.Resource = s
+end)
+
+createDropdown(miscPage, "Resource Filter", {
+    "All", "Tree", "Stone", "Gold", "Iron", "Diamond"
+}, "All", function(v)
+    Settings.Aura.ResourceFilter = v
+end)
+
+createSlider(miscPage, "Aura Speed", 1, 10, 1, function(v)
+    Settings.Aura.ResourceAuraSpeed = v
+end)
+
+createSlider(miscPage, "Aura Range", 5, 50, 20, function(v)
+    Settings.Aura.Range = v
+end)
+
+createToggle(miscPage, "Auto Plant", false, function(s)
+    farm_autoPlant = s
+    if s then
+        task.spawn(function()
+            while farm_autoPlant do
+                local boxes = farm_getPlantBoxes(farm_plantRange)
+                local availableBoxes = {}
+                
+                for _, box in ipairs(boxes) do
+                    if not box.dep:FindFirstChild("Seed") then
+                        local eid = box.eid
+                        if not plantedBoxes[eid] or tick() - plantedBoxes[eid] > 0.5 then
+                            table.insert(availableBoxes, box)
+                        end
+                    end
+                end
+                
+                table.sort(availableBoxes, function(a, b) return a.dist < b.dist end)
+                
+                for _, box in ipairs(availableBoxes) do
+                    if not farm_autoPlant then break end
+                    if tick() - lastPlantTime >= farm_plantDelay then
+                        farm_plantSeed(box.eid, fruitToItemID[farm_selectedFruit] or 94)
+                        lastPlantTime = tick()
+                        task.wait(farm_plantDelay)
+                    end
+                end
+                
+                for id, time in pairs(plantedBoxes) do
+                    if tick() - time > 5 then
+                        plantedBoxes[id] = nil
+                    end
+                end
+                
+                task.wait(0.05)
+            end
+        end)
+    end
+end)
+
+createToggle(miscPage, "Auto Harvest", false, function(s)
+    farm_autoHarvest = s
+    if s then
+        task.spawn(function()
+            while farm_autoHarvest do
+                local bushes = farm_getBushes(farm_plantRange, farm_selectedFruit)
+                
+                table.sort(bushes, function(a, b) return a.dist < b.dist end)
+                
+                for _, bush in ipairs(bushes) do
+                    if not farm_autoHarvest then break end
+                    farm_harvestBush(bush.eid)
+                    task.wait(0.1)
+                end
+                
+                task.wait(0.1)
+            end
+        end)
+    end
+end)
+
+createDropdown(miscPage, "Farm Fruit", farm_fruitList, "Bloodfruit", function(v)
+    farm_selectedFruit = v
+end)
+
+createSlider(miscPage, "Plant Range", 10, 50, 30, function(v)
+    farm_plantRange = v
+end)
+
+createSlider(miscPage, "Plant Delay", 0.05, 1, 0.1, function(v)
+    farm_plantDelay = v
+end)
+
+-- ============================================
+-- GOLD FARM ВКЛАДКА (С ПОЛНОЙ СИСТЕМОЙ WAYPOINTS)
+-- ============================================
+
+-- Основной переключатель
+createToggle(goldPage, "Auto Gold Farm", false, function(s)
+    GoldFarm.Enabled = s
+    if s then
+        GoldFarm:Start()
+        pcall(function()
+            StarterGui:SetCore("SendNotification", {
+                Title = "Gold Farm",
+                Text = "Включён",
+                Duration = 2
+            })
+        end)
+    else
+        GoldFarm:Stop()
+        pcall(function()
+            StarterGui:SetCore("SendNotification", {
+                Title = "Gold Farm",
+                Text = "Выключен",
+                Duration = 1
+            })
+        end)
+    end
+end)
+
+-- ===== УПРАВЛЕНИЕ WAYPOINTS (ТОЧКАМИ) =====
+createButton(goldPage, "📍 Add Current Waypoint", function()
+    local success, msg = GoldFarm:addCurrentWaypoint()
+    pcall(function()
+        StarterGui:SetCore("SendNotification", {
+            Title = "Gold Waypoints",
+            Text = msg,
+            Duration = 2
+        })
+    end)
+end)
+
+createButton(goldPage, "🗑️ Clear All Waypoints", function()
+    local success, msg = GoldFarm:clearWaypoints()
+    pcall(function()
+        StarterGui:SetCore("SendNotification", {
+            Title = "Gold Waypoints",
+            Text = msg,
+            Duration = 2
+        })
+    end)
+end)
+
+createButton(goldPage, "⏪ Remove Last Waypoint", function()
+    local success, msg = GoldFarm:removeLastWaypoint()
+    pcall(function()
+        StarterGui:SetCore("SendNotification", {
+            Title = "Gold Waypoints",
+            Text = msg,
+            Duration = 2
+        })
+    end)
+end)
+
+createToggle(goldPage, "Auto Tween (Move by Waypoints)", false, function(s)
+    GoldFarm.AutoTween = s
+    if s then
+        GoldFarm.CurrentWaypointIndex = 1
+        pcall(function()
+            StarterGui:SetCore("SendNotification", {
+                Title = "Gold Waypoints",
+                Text = "Auto Tween включён",
+                Duration = 2
+            })
+        end)
+    else
+        pcall(function()
+            StarterGui:SetCore("SendNotification", {
+                Title = "Gold Waypoints",
+                Text = "Auto Tween выключен",
+                Duration = 1
+            })
+        end)
+    end
+end)
+
+createSlider(goldPage, "Tween Speed", 10, 32, 16, function(v)
+    GoldFarm.TweenSpeed = v
+end)
+
+-- ===== КОПИРОВАНИЕ/ВСТАВКА WAYPOINTS =====
+local goldWaypointData = ""
+
+createInput(goldPage, "Waypoint Data", "Paste waypoint data here...", function(v)
+    goldWaypointData = v
+end)
+
+createButton(goldPage, "📋 Copy Waypoints", function()
+    local data = GoldFarm:copyWaypoints()
+    if data ~= "" then
+        pcall(function()
+            StarterGui:SetCore("SendNotification", {
+                Title = "Gold Waypoints",
+                Text = "Copied to clipboard!",
+                Duration = 2
+            })
+        end)
+    end
+end)
+
+createButton(goldPage, "📥 Load Waypoints", function()
+    if goldWaypointData and goldWaypointData ~= "" then
+        local success = GoldFarm:loadWaypointsFromString(goldWaypointData)
+        pcall(function()
+            StarterGui:SetCore("SendNotification", {
+                Title = "Gold Waypoints",
+                Text = success and "Waypoints loaded!" or "Failed to load!",
+                Duration = 3
+            })
+        end)
+        goldWaypointData = ""
+    end
+end)
+
+-- ===== НАСТРОЙКИ GOLD FARM =====
+createSlider(goldPage, "Farm Range", 10, 100, 50, function(v)
+    GoldFarm.Range = v
+end)
+
+createSlider(goldPage, "Min Gold Amount", 1, 50, 5, function(v)
+    GoldFarm.MinGold = v
+end)
+
+createDropdown(goldPage, "Target Type", {
+    "Gold Vein", "Gold Ore", "Gold", "All"
+}, "All", function(v)
+    GoldFarm.UseVeins = (v == "Gold Vein" or v == "All")
+    GoldFarm.UseOres = (v == "Gold Ore" or v == "All")
+    GoldFarm.UseGold = (v == "Gold" or v == "All")
+    GoldFarm.TargetType = v
+end)
+
+createDropdown(goldPage, "Movement Mode", {
+    "Walk", "Tween"
+}, "Walk", function(v)
+    GoldFarm.MovementMode = v
+end)
+
+createSlider(goldPage, "Walk Speed", 10, 32, 16, function(v)
+    GoldFarm.WalkSpeed = v
+end)
+
+createSlider(goldPage, "Node Cooldown", 0.1, 5, 0.5, function(v)
+    GoldFarm.NodeCooldown = v
+end)
+
+createButton(goldPage, "Clear Recorded Positions", function()
+    GoldFarm.RecordedPositions = {}
+    GoldFarm.CurrentWaypointIndex = 1
+    pcall(function()
+        StarterGui:SetCore("SendNotification", {
+            Title = "Gold Farm",
+            Text = "Positions cleared!",
+            Duration = 2
+        })
+    end)
+end)
+
+createButton(goldPage, "Record Current Position", function()
+    local char = LocalPlayer.Character
+    if char then
+        local root = char:FindFirstChild("HumanoidRootPart")
+        if root then
+            table.insert(GoldFarm.RecordedPositions, {
+                X = root.Position.X,
+                Y = root.Position.Y,
+                Z = root.Position.Z
+            })
+            pcall(function()
+                StarterGui:SetCore("SendNotification", {
+                    Title = "Gold Farm",
+                    Text = "Position #" .. #GoldFarm.RecordedPositions .. " recorded!",
+                    Duration = 2
+                })
+            end)
+        end
+    end
+end)
+
+-- Счётчик waypoints
+local waypointCounter = Instance.new("TextLabel")
+waypointCounter.Size = UDim2.new(1, -10, 0, 25)
+waypointCounter.Position = UDim2.new(0, 5, 0, 0)
+waypointCounter.BackgroundColor3 = COLORS.CardBg
+waypointCounter.BackgroundTransparency = 0.3
+waypointCounter.Text = "💰 Waypoints: 0"
+waypointCounter.TextColor3 = COLORS.Text
+waypointCounter.Font = Enum.Font.Gotham
+waypointCounter.TextSize = 12
+waypointCounter.Parent = goldPage
+table.insert(themeElements.Cards, waypointCounter)
+table.insert(themeElements.Texts, waypointCounter)
+
+-- Обновление счётчика
+task.spawn(function()
+    while true do
+        if waypointCounter then
+            waypointCounter.Text = "💰 Waypoints: " .. #GoldFarm.Waypoints
+            if GoldFarm.AutoTween then
+                waypointCounter.Text = waypointCounter.Text .. " | 🔄 Moving to #" .. GoldFarm.CurrentWaypointIndex
+            end
+        end
+        task.wait(0.5)
+    end
+end)
+
+-- ============================================
+-- SETTING ВКЛАДКА
+-- ============================================
+createDropdown(settingPage, "GUI Theme", {
+    "Dark (Черная)", "Midnight (Синяя)", "Purple (Фиолетовая)", 
+    "Emerald (Изумрудная)", "Crimson (Красная)", "Gold (Золотая)",
+    "Cyber (Неоновая)", "Pink (Розовая)", "Ocean (Океанская)",
+    "Forest (Лесная)", "Blood (Кровавая)", "Galaxy (Галактика)"
+}, "Dark (Черная)", function(selectedTheme)
+    applyTheme(selectedTheme)
+    if keyIndicator then
+        keyIndicator.Text = "🔑 " .. tostring(guiOpenKey.Name)
+    end
+end)
+
+createBindButton(settingPage, "Toggle GUI Key", guiOpenKey, function(key)
+    guiOpenKey = key
+    if keyIndicator then
+        keyIndicator.Text = "🔑 " .. tostring(key.Name)
+    end
+    pcall(function()
+        StarterGui:SetCore("SendNotification", {
+            Title = "Keybind Set",
+            Text = "GUI Toggle: " .. key.Name,
+            Duration = 2
+        })
+    end)
+end)
+
+-- ============================================
+-- ОБРАБОТКА КЛАВИШИ ОТКРЫТИЯ GUI
+-- ============================================
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if gameProcessed then return end
+    if input.KeyCode == guiOpenKey then
+        toggleGUI()
+    end
+end)
+
+-- ============================================
+-- ЗАПУСК
+-- ============================================
+showPage("Player")
+
+-- Глобальный доступ
+_G.VoidHub = {
+    GoldFarm = GoldFarm,
+    ToggleGUI = toggleGUI,
+    ApplyTheme = applyTheme,
+    SetOpenKey = function(key)
+        guiOpenKey = key
+        if keyIndicator then
+            keyIndicator.Text = "🔑 " .. tostring(key.Name)
+        end
+    end,
+}
+
+print("=== VOID HUB 3.0 LOADED ===")
+print("📌 Press " .. tostring(guiOpenKey.Name) .. " to toggle GUI")
+print("💚 Auto Heal (v1.0) integrated!")
+print("💰 Gold Farm with WAYPOINTS loaded!")
+print("🎨 12 themes available!")
+print("==============================")
